@@ -1,0 +1,35 @@
+name: Coin Scanner
+
+on:
+  schedule:
+    # Runs every 15 minutes. Change to match CONFIG["interval"] in scanner.py.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore scanner state (remembers past signals between runs)
+        uses: actions/cache@v4
+        with:
+          path: scanner_state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+
+      - name: Run scanner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python scanner.py
