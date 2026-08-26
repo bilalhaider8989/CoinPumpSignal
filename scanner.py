@@ -14,7 +14,7 @@ import requests
 
 from indicators import dema, supertrend, moving_average
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_BASE = "https://data-api.binance.vision"
 STATE_FILE = Path(__file__).parent / "scanner_state.json"
 
 # ============================================================
