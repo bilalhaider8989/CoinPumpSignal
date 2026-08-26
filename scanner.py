@@ -46,7 +46,7 @@ CONFIG = {
         "enabled": True,
         "fast_length": 9,
         "slow_length": 20,
-        "type": "EMA",           # SMA, EMA, or WMA
+        "type": "SMA",           # SMA, EMA, or WMA
     },
 
     # ---- 4. Gap confirmation for the MA cross (on/off, % or StdDev) ----
