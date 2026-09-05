@@ -20,6 +20,7 @@ message. Does not touch or depend on the DEMA/MA-cross or scalp logic.
 import json
 import os
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +31,7 @@ from indicators import dema, supertrend, moving_average
 BINANCE_BASE = "https://data-api.binance.vision"
 STATE_FILE = Path(__file__).parent / "scanner_state.json"
 NOUMAN_STATE_FILE = Path(__file__).parent / "nouman_state.json"
+SQUEEZE_STATE_FILE = Path(__file__).parent / "squeeze_state.json"
 
 # ============================================================
 # CONFIG - edit these to match your Pine script settings
@@ -215,7 +217,94 @@ CONFIG = {
         },
     },
 
-    # ---- 5. Discord notifications (free, no bot needed) ----
+    # ---- SQUEEZE BREAKOUT (new, independent - a LEADING signal) ----
+    # Everything else in this file (DEMA/MA-cross, scalp_mode, Nouman
+    # Strategy) is a trend-CONFIRMATION system: SuperTrend, DEMA, and MA
+    # crosses only fire once a move is already underway - by design they
+    # lag the actual pump. This module is different in kind: it looks for
+    # a volatility contraction ("squeeze" - Bollinger Bands pinched
+    # tight, meaning the coin has gone quiet) immediately followed by a
+    # breakout above the bands on rising volume. That's the closest a
+    # public-data technical signal gets to catching a move AS it starts
+    # rather than after - it's still reactive, not predictive, and will
+    # have more false positives than the slower signals above (that's
+    # the fundamental trade-off of reacting earlier).
+    #
+    # OFF by default - it's a fast, noisier 1m/5m signal, meant to be
+    # tuned before you trust it. Runs on a configurable small watchlist
+    # by default (fewer symbols = each scan pass finishes in seconds, not
+    # minutes - see the note on symbol_whitelist below).
+    "squeeze_breakout": {
+        "enabled": False,
+
+        "interval": "1m",          # "1m" or "5m" - short by design
+        "candle_limit": 300,
+
+        # Only scan THESE symbols instead of the full ~500+ USDT pair
+        # universe. For 1-5 minute scalping, looping through hundreds of
+        # symbols with request_sleep between each call takes real
+        # minutes - by the time the loop reaches symbol #300, several
+        # minutes have passed since the scan started, which alone can
+        # explain "the coin already pumped by the time I saw it," no
+        # matter which indicator is used.
+        #
+        # Leave this EMPTY (the default) and it auto-selects the top
+        # `auto_top_n` USDT pairs by 24h volume every run - you don't
+        # have to guess which coins to watch; "which coins are liquid
+        # right now" is answered by the API, not a prediction. Fill in
+        # specific symbols here only if you want a fixed, hand-picked
+        # list instead (e.g. ["BTCUSDT", "ETHUSDT", ...]) - that always
+        # takes priority over auto-selection when non-empty.
+        "symbol_whitelist": [],
+        "auto_top_n": 50,                    # used only when whitelist is empty
+        "min_24h_volume_usdt": 3_000_000,    # floor applied either way
+
+        # Bollinger Bands (basis = SMA)
+        "bb_length": 20,
+        "bb_mult": 2.0,
+
+        # "Squeeze" = current band width sits at/near the bottom of its
+        # own recent range - i.e. the coin has been unusually quiet.
+        "squeeze_lookback": 50,
+        "squeeze_percentile": 0.20,   # width must be in the bottom 20% of the lookback window
+
+        # Breakout = close crosses back above the upper band right after
+        # being squeezed, confirmed by a volume pop vs recent baseline.
+        "vol_lookback": 10,
+        "vol_multiplier": 1.5,
+
+        # Used only by the companion websocket_scanner.py (optional) -
+        # how long a single live-monitoring burst runs before exiting
+        # cleanly. Keep this comfortably under your cron interval (e.g.
+        # 240s if you trigger every 5 minutes).
+        "websocket_burst": {
+            "max_runtime_seconds": 240,
+        },
+    },
+
+    # ---- 5. Alert time windows (optional quiet hours / focus hours) ----
+    # OFF by default - when off, alerts send any time, exactly as before.
+    # When on, Discord messages are only actually SENT while the current
+    # UTC time (converted to your local offset) falls inside one of the
+    # windows below; everything still gets scanned and printed to the
+    # console/log either way, just not pushed to Discord outside these
+    # hours. This does NOT change what the market does - it only reduces
+    # notification noise to the hours you've personally observed being
+    # more active. Pre-filled below with the 4 Pakistan-time (UTC+5, no
+    # DST) windows you described - edit freely, add/remove windows, or
+    # change the offset for your own timezone.
+    "alert_time_windows": {
+        "enabled": False,
+        "timezone_utc_offset": 5,   # PKT = UTC+5. Change for your timezone.
+        "windows": [                # local HH:MM 24h, [start, end)
+            ("05:00", "06:00"),
+            ("13:00", "14:00"),
+            ("18:00", "19:30"),
+            ("20:30", "21:30"),
+        ],
+    },
+
+    # ---- 6. Discord notifications (free, no bot needed) ----
     "discord_webhook_url": os.environ.get("DISCORD_WEBHOOK_URL", ""),
 }
 
@@ -250,6 +339,21 @@ def get_24h_volumes() -> dict[str, float]:
     r = requests.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=20)
     r.raise_for_status()
     return {d["symbol"]: float(d["quoteVolume"]) for d in r.json()}
+
+
+def get_top_symbols_by_volume(n: int, min_24h_volume_usdt: float = 0.0,
+                               volume_24h: dict | None = None) -> list[str]:
+    """USDT pairs only, ranked by 24h quote volume (highest first),
+    capped to the top n. Used to auto-build a watchlist for the
+    Squeeze Breakout module instead of you having to guess/maintain one
+    by hand - "which 50 coins are actually liquid right now" is
+    something the API already answers, no prediction needed."""
+    symbols = get_usdt_symbols()
+    if volume_24h is None:
+        volume_24h = get_24h_volumes()
+    eligible = [s for s in symbols if volume_24h.get(s, 0.0) >= min_24h_volume_usdt]
+    eligible.sort(key=lambda s: volume_24h.get(s, 0.0), reverse=True)
+    return eligible[:n]
 
 
 def get_klines(symbol: str, interval: str | None = None, limit: int | None = None) -> pd.DataFrame:
@@ -298,7 +402,33 @@ def save_state(state: dict, path: Path = STATE_FILE) -> None:
 # Discord notification
 # ============================================================
 
+def _in_alert_window(now_utc: datetime | None = None) -> bool:
+    """True if alerts should be sent right now. Always True when the
+    alert_time_windows feature is off (default) - existing behavior is
+    unchanged unless you explicitly enable it."""
+    cfg = CONFIG["alert_time_windows"]
+    if not cfg["enabled"]:
+        return True
+
+    now_utc = now_utc or datetime.utcnow()
+    local_time = (now_utc + timedelta(hours=cfg["timezone_utc_offset"])).time()
+
+    for start_str, end_str in cfg["windows"]:
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end = datetime.strptime(end_str, "%H:%M").time()
+        if start <= end:
+            if start <= local_time < end:
+                return True
+        else:  # window wraps past midnight, e.g. ("23:00", "01:00")
+            if local_time >= start or local_time < end:
+                return True
+    return False
+
+
 def send_discord(message: str) -> None:
+    if not _in_alert_window():
+        print("  (Outside configured alert_time_windows - message logged here but NOT sent to Discord)")
+        return
     url = CONFIG["discord_webhook_url"]
     if not url:
         print("  (Discord not configured - set DISCORD_WEBHOOK_URL env var / secret)")
@@ -757,6 +887,103 @@ def run_nouman_scan(symbols: list[str], volume_24h: dict) -> None:
 
 
 # ============================================================
+# SQUEEZE BREAKOUT (new, independent - a LEADING signal, see CONFIG note)
+# ============================================================
+
+def bollinger_bands(close: pd.Series, length: int, mult: float) -> pd.DataFrame:
+    basis = close.rolling(length).mean()
+    std = close.rolling(length).std()
+    upper = basis + mult * std
+    lower = basis - mult * std
+    width = (upper - lower) / basis
+    return pd.DataFrame({"basis": basis, "upper": upper, "lower": lower, "width": width})
+
+
+def check_symbol_squeeze(symbol: str, state: dict, volume_24h: dict) -> dict | None:
+    cfg = CONFIG["squeeze_breakout"]
+    min_needed = max(cfg["bb_length"], cfg["squeeze_lookback"], cfg["vol_lookback"]) + 10
+
+    df = get_klines(symbol, interval=cfg["interval"], limit=max(cfg["candle_limit"], min_needed))
+    if len(df) < min_needed:
+        return None
+    df = df.iloc[:-1]  # drop the still-forming candle
+
+    bb = bollinger_bands(df["close"], cfg["bb_length"], cfg["bb_mult"])
+    close = df["close"]
+    vol = df["volume"]
+
+    # Squeeze: the bar just before the breakout candle had a band width
+    # in the bottom `squeeze_percentile` of its own recent history.
+    width_threshold = bb["width"].rolling(cfg["squeeze_lookback"]).quantile(cfg["squeeze_percentile"])
+    was_squeezed = bb["width"].iloc[-2] <= width_threshold.iloc[-2]
+    if not was_squeezed:
+        return None
+
+    # Breakout: this candle closes above the upper band, the previous
+    # one did not (a fresh break, not an already-extended move).
+    fresh_breakout = close.iloc[-1] > bb["upper"].iloc[-1] and close.iloc[-2] <= bb["upper"].iloc[-2]
+    if not fresh_breakout:
+        return None
+
+    # Volume confirmation.
+    baseline = vol.iloc[-(cfg["vol_lookback"] + 1):-1].mean()
+    vol_ratio = (vol.iloc[-1] / baseline) if baseline > 0 else 0.0
+    if vol_ratio < cfg["vol_multiplier"]:
+        return None
+
+    # De-dup: only alert once per closed candle.
+    candle_key = str(int(df["close_time"].iloc[-1]))
+    sym_state = state.get(symbol, {})
+    if sym_state.get("last_alert_candle") == candle_key:
+        return None
+    sym_state["last_alert_candle"] = candle_key
+    state[symbol] = sym_state
+
+    return {
+        "symbol": symbol,
+        "price": close.iloc[-1],
+        "vol_ratio": vol_ratio,
+        "width_pct": bb["width"].iloc[-1] * 100,
+        "vol_24h": volume_24h.get(symbol, 0.0),
+    }
+
+
+def run_squeeze_scan(symbols: list[str], volume_24h: dict) -> None:
+    cfg = CONFIG["squeeze_breakout"]
+    print(f"\nSqueeze Breakout: scanning {len(symbols)} pairs on {cfg['interval']}...")
+
+    state = load_state(SQUEEZE_STATE_FILE)
+    hits = []
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            hit = check_symbol_squeeze(symbol, state, volume_24h)
+            if hit:
+                hits.append(hit)
+        except Exception as e:
+            print(f"  {symbol}: squeeze skipped ({e})")
+        time.sleep(CONFIG["request_sleep"])
+
+        if i % 50 == 0:
+            print(f"  ...{i}/{len(symbols)} squeeze-scanned")
+
+    save_state(state, SQUEEZE_STATE_FILE)
+
+    if not hits:
+        print("  No squeeze breakouts this run.")
+        return
+
+    header = "⚡ **Squeeze Breakout**"
+    lines = [
+        f"{h['symbol']} | 24h Vol: {_fmt_vol(h['vol_24h'])} USDT | "
+        f"Vol Spike: {h['vol_ratio']:.2f}x | BB Width: {h['width_pct']:.2f}%"
+        for h in hits
+    ]
+    msg = header + "\n" + "\n".join(lines)
+    print(msg)
+    send_discord(msg)
+
+
+# ============================================================
 # Main scan loop
 # ============================================================
 
@@ -768,7 +995,8 @@ def run_scan() -> None:
     volume_24h: dict[str, float] = {}
     vol_cfg = CONFIG["volume_spike"]
     nouman_cfg = CONFIG["nouman_strategy"]
-    if vol_cfg["enabled"] or nouman_cfg["enabled"]:
+    squeeze_cfg = CONFIG["squeeze_breakout"]
+    if vol_cfg["enabled"] or nouman_cfg["enabled"] or squeeze_cfg["enabled"]:
         print("Fetching 24h volume for the liquidity floor (1 call, all symbols)...")
         volume_24h = get_24h_volumes()
 
@@ -814,6 +1042,18 @@ def run_scan() -> None:
         floor = nouman_cfg["min_24h_volume_usdt"]
         nouman_symbols = [s for s in symbols_all if volume_24h.get(s, 0.0) >= floor]
         run_nouman_scan(nouman_symbols, volume_24h)
+
+    # ---- Squeeze Breakout: fully separate pass, own liquidity floor ----
+    # Uses your fixed symbol_whitelist if you set one; otherwise
+    # auto-selects the top auto_top_n USDT pairs by 24h volume so you
+    # never have to hand-maintain a watchlist.
+    if squeeze_cfg["enabled"]:
+        if squeeze_cfg["symbol_whitelist"]:
+            squeeze_symbols = squeeze_cfg["symbol_whitelist"]
+        else:
+            squeeze_symbols = get_top_symbols_by_volume(
+                squeeze_cfg["auto_top_n"], squeeze_cfg["min_24h_volume_usdt"], volume_24h)
+        run_squeeze_scan(squeeze_symbols, volume_24h)
 
 
 if __name__ == "__main__":
