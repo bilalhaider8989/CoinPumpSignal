@@ -43,21 +43,26 @@ CONFIG = {
     "request_sleep": 0.15,
 
     # ---- 3. DEMA200 filter (on/off + min % above) ----
+    # Set to False by default so only the Nouman Strategy messages send.
+    # Flip back to True (along with ma_cross below) if you ever want the
+    # original DEMA/MA-cross signals running alongside it again.
     "dema": {
-        "enabled": True,
+        "enabled": False,
         "length": 200,
         "min_pct_above": 0.3,   # set to 0 to allow ANY close above DEMA
     },
 
-    # SuperTrend (used by the DEMA signal)
+    # SuperTrend (shared: used by the DEMA signal above AND reused by the
+    # Nouman Strategy's requirement 1 further down)
     "supertrend": {
         "atr_length": 12,
         "multiplier": 3.0,
     },
 
     # ---- 2. MA9/MA20 cross (configurable lengths) ----
+    # Also off by default - see the "dema" note above.
     "ma_cross": {
-        "enabled": True,
+        "enabled": False,
         "fast_length": 9,
         "slow_length": 20,
         "type": "EMA",           # SMA, EMA, or WMA
@@ -196,6 +201,17 @@ CONFIG = {
             "enabled": False,
             "lookback": 10,
             "multiplier": 1.2,
+        },
+
+        # Optional "rising volume" filter - OFF by default. When on,
+        # each of the previous `lookback` closed candles on the signal
+        # timeframe (1h or 30m, whichever signal_interval is set to) must
+        # have STRICTLY higher volume than the one before it - i.e. a
+        # clean, uninterrupted build-up in volume leading into the signal
+        # candle. Any flat or lower step anywhere in that window fails it.
+        "volume_increasing_filter": {
+            "enabled": False,
+            "lookback": 5,
         },
     },
 
@@ -546,9 +562,12 @@ def smoothed_heiken_ashi(df: pd.DataFrame, len1: int, len2: int, gray_body_ratio
     (TradingView ROokknI2): raw OHLC is EMA-smoothed (len1), converted to
     Heiken Ashi, then EMA-smoothed again (len2). The published script only
     outputs red/green (col = o2>c2 ? red : lime) - GRAY is an addition
-    here: a candle whose smoothed body is a small fraction of its own
-    high-low range (< gray_body_ratio) is classified GRAY instead of
-    GREEN/RED. See the CONFIG note for why/how to adjust this.
+    here, layered ONLY on top of GREEN: a candle that would be green but
+    whose smoothed body is a small fraction of its own high-low range
+    (< gray_body_ratio) is reclassified GRAY instead, representing a
+    weakening/stalling uptrend candle. A RED candle stays RED no matter
+    how small its body is - it never gets reclassified as GRAY. See the
+    CONFIG note for why/how to adjust this.
     """
     o = df["open"].ewm(span=len1, adjust=False).mean()
     c = df["close"].ewm(span=len1, adjust=False).mean()
@@ -572,9 +591,13 @@ def smoothed_heiken_ashi(df: pd.DataFrame, len1: int, len2: int, gray_body_ratio
     rng = (h2 - l2).replace(0, 1e-12)
     body_ratio = body / rng
 
+    # Base color exactly matches the original indicator's rule.
     color = pd.Series("RED", index=df.index, dtype=object)
-    color[c2 >= o2] = "GREEN"
-    color[body_ratio < gray_body_ratio] = "GRAY"
+    is_green = c2 >= o2
+    color[is_green] = "GREEN"
+    # Gray only overrides a GREEN candle with a small body - RED is never
+    # touched, so a small red body still reports/alerts as RED.
+    color[is_green & (body_ratio < gray_body_ratio)] = "GRAY"
 
     return pd.DataFrame({"o2": o2, "c2": c2, "h2": h2, "l2": l2, "color": color})
 
@@ -594,6 +617,7 @@ def check_symbol_nouman(symbol: str, state: dict, volume_24h: dict) -> dict | No
     cfg = CONFIG["nouman_strategy"]
     st_cfg = CONFIG["supertrend"]
     vol_cfg = cfg["volume_1h_filter"]
+    vol_inc_cfg = cfg["volume_increasing_filter"]
 
     # ---- Requirement 1: 1h SuperTrend must be bullish ----
     df_st = get_klines(symbol, interval="1h", limit=max(300, st_cfg["atr_length"] * 5))
@@ -606,7 +630,7 @@ def check_symbol_nouman(symbol: str, state: dict, volume_24h: dict) -> dict | No
 
     # ---- Requirement 2: signal-timeframe candle color + RSI cross ----
     candles_per_hour = max(1, 60 // _interval_minutes(cfg["signal_interval"]))
-    min_needed = max(cfg["ha_len1"], cfg["ha_len2"], cfg["rsi_length"]) * 4 + 10
+    min_needed = max(cfg["ha_len1"], cfg["ha_len2"], cfg["rsi_length"], vol_inc_cfg["lookback"]) * 4 + 10
     df_sig = get_klines(symbol, interval=cfg["signal_interval"], limit=max(cfg["candle_limit"], min_needed))
     if len(df_sig) < min_needed:
         return None
@@ -625,6 +649,12 @@ def check_symbol_nouman(symbol: str, state: dict, volume_24h: dict) -> dict | No
     if last_color == "GRAY" and cfg["gray_prev_candle_rule"] and prev_color == "GREEN":
         return None
 
+    # RSI cross-UP: this is a genuine crossover, not a level check - the
+    # PREVIOUS closed candle's RSI must be at/below the level and the
+    # CURRENT (signal) candle's RSI must be above it. That's true whether
+    # the previous value was 45, 51.9, or anything else <= level, so
+    # "crossing from ~45 up through 52" and "crossing from 51 up through
+    # 52" both satisfy this the same way.
     level = cfg["rsi_cross_level"]
     rsi_prev, rsi_now = rsi_series.iloc[-2], rsi_series.iloc[-1]
     crossed_up = rsi_prev <= level and rsi_now > level
@@ -640,6 +670,12 @@ def check_symbol_nouman(symbol: str, state: dict, volume_24h: dict) -> dict | No
         if ratio < vol_cfg["multiplier"]:
             return None
 
+    # ---- Optional: volume must rise every candle for the last N candles ----
+    if vol_inc_cfg["enabled"]:
+        recent_vols = df_sig["volume"].iloc[-vol_inc_cfg["lookback"]:]
+        if len(recent_vols) < vol_inc_cfg["lookback"] or not recent_vols.diff().iloc[1:].gt(0).all():
+            return None
+
     # ---- De-dup: only alert once per closed signal candle ----
     candle_key = str(int(df_sig["close_time"].iloc[-1]))
     sym_state = state.get(symbol, {})
@@ -651,6 +687,7 @@ def check_symbol_nouman(symbol: str, state: dict, volume_24h: dict) -> dict | No
     return {
         "symbol": symbol,
         "price": df_sig["close"].iloc[-1],
+        "rsi_prev": rsi_prev,
         "rsi": rsi_now,
         "color": last_color,
         "vol_1h": vol_1h,
@@ -686,7 +723,8 @@ def run_nouman_scan(symbols: list[str], volume_24h: dict) -> None:
     header = "🎯 **Nouman Strategy**"
     lines = [
         f"{h['symbol']} | 1h Vol: {_fmt_vol(h['vol_1h'])} USDT | "
-        f"24h Vol: {_fmt_vol(h['vol_24h'])} USDT | RSI: {h['rsi']:.1f} | "
+        f"24h Vol: {_fmt_vol(h['vol_24h'])} USDT | "
+        f"RSI: {h['rsi_prev']:.1f}→{h['rsi']:.1f} | "
         f"Candle: {h['color']} | SuperTrend: Bullish"
         for h in hits
     ]
@@ -745,23 +783,27 @@ def run_scan() -> None:
     state = load_state()
     all_hits = []
 
-    for i, symbol in enumerate(symbols, 1):
-        try:
-            hits = check_symbol(symbol, state, volume_24h)
-            for h in hits:
-                all_hits.append(h)
-                msg = f"[{h['type']}] {h['symbol']} @ {h['price']} ({h['detail']})"
-                print(msg)
-                send_discord(msg)
-        except Exception as e:
-            print(f"  {symbol}: skipped ({e})")
-        time.sleep(CONFIG["request_sleep"])
+    main_scan_active = CONFIG["dema"]["enabled"] or CONFIG["ma_cross"]["enabled"]
+    if not main_scan_active:
+        print("  (DEMA + MA-cross both disabled - skipping the main scan loop entirely)")
+    else:
+        for i, symbol in enumerate(symbols, 1):
+            try:
+                hits = check_symbol(symbol, state, volume_24h)
+                for h in hits:
+                    all_hits.append(h)
+                    msg = f"[{h['type']}] {h['symbol']} @ {h['price']} ({h['detail']})"
+                    print(msg)
+                    send_discord(msg)
+            except Exception as e:
+                print(f"  {symbol}: skipped ({e})")
+            time.sleep(CONFIG["request_sleep"])
 
-        if i % 50 == 0:
-            print(f"  ...{i}/{len(symbols)} scanned")
+            if i % 50 == 0:
+                print(f"  ...{i}/{len(symbols)} scanned")
 
-    save_state(state)
-    print(f"\nDone. {len(all_hits)} fresh signal(s) found.")
+        save_state(state)
+        print(f"\nDone. {len(all_hits)} fresh signal(s) found.")
 
     # ---- Scalp mode: fully separate pass, only runs if switched on ----
     if CONFIG["scalp_mode"]["enabled"]:
