@@ -2,6 +2,19 @@
 Free Binance scanner - configurable DEMA200 + SuperTrend + MA9/20 cross,
 with Discord notifications. Designed to run on a schedule via GitHub
 Actions, so it works even when your own laptop is off.
+
+Optional add-on: "scalp_mode" - a separate 5m early-scalp radar
+(volume spike + green candle + DEMA200 trend + SuperTrend bullish),
+toggled independently via CONFIG["scalp_mode"]["enabled"]. It does not
+touch or depend on the original DEMA/MA-cross logic in any way.
+
+Optional add-on: "nouman_strategy" - a separate trend-pullback radar.
+Requirement 1 (1h SuperTrend bullish) reuses the SAME supertrend() already
+imported below. Requirement 2 (Smoothed Heiken Ashi candle color + RSI
+cross) is new - see the "NOUMAN STRATEGY" section for the exact rules and
+the assumption made about the "gray" candle state. Toggled independently
+via CONFIG["nouman_strategy"]["enabled"]; own state file, own Discord
+message. Does not touch or depend on the DEMA/MA-cross or scalp logic.
 """
 
 import json
@@ -16,6 +29,7 @@ from indicators import dema, supertrend, moving_average
 
 BINANCE_BASE = "https://data-api.binance.vision"
 STATE_FILE = Path(__file__).parent / "scanner_state.json"
+NOUMAN_STATE_FILE = Path(__file__).parent / "nouman_state.json"
 
 # ============================================================
 # CONFIG - edit these to match your Pine script settings
@@ -46,7 +60,7 @@ CONFIG = {
         "enabled": True,
         "fast_length": 9,
         "slow_length": 20,
-        "type": "SMA",           # SMA, EMA, or WMA
+        "type": "EMA",           # SMA, EMA, or WMA
     },
 
     # ---- 4. Gap confirmation for the MA cross (on/off, % or StdDev) ----
@@ -57,6 +71,134 @@ CONFIG = {
         "stdev_multiplier": 1.0,
     },
 
+    # ---- Volume spike (MA9/20 cross only) ----
+    # All three are REQUIRED when enabled: any one failing suppresses the
+    # alert entirely. "Weight" is expressed as strictness, not a blended
+    # score - the 15m multiplier is intentionally harder to clear than the
+    # 1h one, so it dominates without needing an opaque formula.
+    "volume_spike": {
+        "enabled": True,
+
+        # 15-minute spike: the fire candle vs its own recent baseline.
+        # Primary signal - matches your scan cadence, hardest bar to clear.
+        "lookback_15m": 10,       # candles used to build the baseline
+        "multiplier_15m": 1.2,    # fire candle's volume must be >= this x baseline
+
+        # 1-hour spike: sum of the last ~1h of candles vs the same-sized
+        # window before it. Secondary confirmation - easier bar to clear,
+        # so it has less influence than the 15m check.
+        "lookback_1h": 10,        # prior 1h windows averaged for the baseline
+        "multiplier_1h": 1.2,
+
+        # 24h USDT liquidity floor - a hard minimum, not a spike check.
+        # Fetched once per run for every symbol (1 API call, not per-symbol)
+        # and applied BEFORE candles are even fetched, so illiquid pairs
+        # never reach the signal logic at all.
+        "min_24h_volume_usdt": 3_000_000,
+    },
+
+    # ---- Squeeze (MA9/20 cross only) ----
+    # INFORMATIONAL when enabled: checks whether MA9/MA20 were tight together
+    # for `lookback` candles right before the cross. Shown in the Discord
+    # message ("squeeze=yes/no") but never blocks the alert.
+    "squeeze": {
+        "enabled": True,
+        "lookback": 10,       # candles checked immediately before the cross
+        "max_pct": 0.15,      # MA9/MA20 gap must stay <= this the whole window
+    },
+
+    # ---- SCALP MODE (new, independent layer) ----
+    # Master switch: when False, this entire block is skipped and the
+    # script behaves EXACTLY as before. When True, it runs as a separate
+    # pass after the main scan and posts its own Discord message - it does
+    # not read or write ma_armed/dema_trade_taken state at all.
+    #
+    # Goal: catch early scalps by ranking symbols on 5m volume spike, but
+    # ONLY among candidates that also show a green candle / price-up move
+    # AND are still trending (above DEMA200, SuperTrend bullish) - same
+    # trend filter as your main DEMA signal, just applied on 5m candles.
+    "scalp_mode": {
+        "enabled": False,        # <-- flip this on/off
+
+        "interval": "5m",
+        "candle_limit": 500,     # needs >= dema_length*2 candles of history
+        "top_n": 5,              # only the top N ranked candidates get posted
+
+        # 5m volume spike: fire candle vs its own recent baseline
+        "vol_lookback": 6,
+        "vol_multiplier": 1.5,
+
+        # Price confirmation: candle must close green, and move at least
+        # this much (0.0 = any green candle qualifies)
+        "min_price_change_pct": 0.0,
+
+        # Trend filter, same idea as the main DEMA200+SuperTrend signal,
+        # computed on 5m candles. Reuses CONFIG["supertrend"] params.
+        "dema_length": 200,
+        "dema_min_pct_above": 0.3,
+    },
+
+    # ---- NOUMAN STRATEGY (new, independent layer) ----
+    # Requirement 1: 1h SuperTrend must be bullish. Reuses the SAME
+    # supertrend() import + CONFIG["supertrend"] params already defined
+    # above ("the SuperTrend already in the scanner is good") - just
+    # evaluated on the 1h chart specifically, regardless of whatever
+    # CONFIG["interval"] the main scan up top is set to.
+    #
+    # Requirement 2: on a configurable signal timeframe (1h by default,
+    # 30m optional), the "Smoothed Heiken Ashi Candles" indicator
+    # (jackvmk, TradingView script ROokknI2) shows a GREEN or GRAY candle,
+    # together with RSI crossing UP through a configurable level (52).
+    #
+    # IMPORTANT ASSUMPTION ABOUT "GRAY":
+    # The original open-source jackvmk script is strictly 2-color
+    # (red/green) - there is no gray state in the published Pine code.
+    # To satisfy your "gray or green" rule, this scanner adds gray as a
+    # doji/indecision detector: when the smoothed candle's body is a small
+    # fraction of its own high-low range (< gray_body_ratio), it's
+    # classified GRAY instead of GREEN/RED. If that doesn't match what you
+    # see on your chart (e.g. you're running a modified copy of the
+    # indicator with its own gray logic), tell me the exact rule/Pine code
+    # and I'll swap it in - everything else here is unaffected.
+    "nouman_strategy": {
+        "enabled": True,          # <-- flip this on/off
+
+        "signal_interval": "1h",  # "1h" or "30m" - the configurable TF
+        "candle_limit": 500,
+
+        # Liquidity floor, checked before any candles are fetched for
+        # this strategy (independent of CONFIG["volume_spike"] above).
+        "min_24h_volume_usdt": 3_000_000,
+
+        # Smoothed Heiken Ashi (jackvmk) smoothing lengths - match these
+        # to your chart's indicator settings if you changed them from
+        # default (10/10).
+        "ha_len1": 10,             # 1st EMA smoothing of raw OHLC
+        "ha_len2": 10,             # 2nd EMA smoothing of the HA values
+        "gray_body_ratio": 0.15,   # body/range below this => GRAY (see note above)
+
+        # RSI cross-up
+        "rsi_length": 14,
+        "rsi_cross_level": 52,    # must cross UP through this level
+
+        # Gray-candle sequence rule: if the signal candle is GRAY, the
+        # candle immediately before it must NOT be GREEN - it must be
+        # GRAY or RED. (No such restriction when the signal candle is
+        # GREEN.)
+        "gray_prev_candle_rule": True,
+
+        # Optional 1h volume-spike filter - OFF by default. When on, the
+        # trailing 1h volume (summed from signal_interval candles) must
+        # be >= multiplier x the average of the previous `lookback` 1h
+        # windows. The 1h volume itself is always shown in the message
+        # regardless of this toggle.
+        "volume_1h_filter": {
+            "enabled": False,
+            "lookback": 10,
+            "multiplier": 1.2,
+        },
+    },
+
     # ---- 5. Discord notifications (free, no bot needed) ----
     "discord_webhook_url": os.environ.get("DISCORD_WEBHOOK_URL", ""),
 }
@@ -65,6 +207,13 @@ CONFIG = {
 # ============================================================
 # Binance data fetching
 # ============================================================
+
+def _interval_minutes(interval: str) -> int:
+    """'15m' -> 15, '1h' -> 60, '4h' -> 240, '1d' -> 1440."""
+    unit = interval[-1]
+    n = int(interval[:-1])
+    return {"m": n, "h": n * 60, "d": n * 1440}[unit]
+
 
 def get_usdt_symbols() -> list[str]:
     r = requests.get(f"{BINANCE_BASE}/api/v3/exchangeInfo", timeout=15)
@@ -79,13 +228,24 @@ def get_usdt_symbols() -> list[str]:
     ]
 
 
-def get_klines(symbol: str) -> pd.DataFrame:
+def get_24h_volumes() -> dict[str, float]:
+    """One call for EVERY symbol's rolling 24h USDT volume - used as a
+    liquidity floor, not fetched per-symbol."""
+    r = requests.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=20)
+    r.raise_for_status()
+    return {d["symbol"]: float(d["quoteVolume"]) for d in r.json()}
+
+
+def get_klines(symbol: str, interval: str | None = None, limit: int | None = None) -> pd.DataFrame:
+    """interval/limit default to CONFIG["interval"]/CONFIG["candle_limit"]
+    so all existing call sites behave exactly as before. Scalp mode passes
+    its own interval/limit explicitly."""
     r = requests.get(
         f"{BINANCE_BASE}/api/v3/klines",
         params={
             "symbol": symbol,
-            "interval": CONFIG["interval"],
-            "limit": CONFIG["candle_limit"],
+            "interval": interval or CONFIG["interval"],
+            "limit": limit or CONFIG["candle_limit"],
         },
         timeout=15,
     )
@@ -108,14 +268,14 @@ def get_klines(symbol: str) -> pd.DataFrame:
 # State persistence (one-shot-per-episode memory across runs)
 # ============================================================
 
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+def load_state(path: Path = STATE_FILE) -> dict:
+    if path.exists():
+        return json.loads(path.read_text())
     return {}
 
 
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def save_state(state: dict, path: Path = STATE_FILE) -> None:
+    path.write_text(json.dumps(state, indent=2))
 
 
 # ============================================================
@@ -134,18 +294,26 @@ def send_discord(message: str) -> None:
 
 
 # ============================================================
-# Per-symbol evaluation
+# Per-symbol evaluation (ORIGINAL - unchanged)
 # ============================================================
 
-def check_symbol(symbol: str, state: dict) -> list[dict]:
+def check_symbol(symbol: str, state: dict, volume_24h: dict | None = None) -> list[dict]:
     """Returns a list of hit dicts (can contain 0, 1, or 2 signals per symbol)."""
     dema_cfg = CONFIG["dema"]
     ma_cfg = CONFIG["ma_cross"]
     gap_cfg = CONFIG["ma_gap"]
+    vol_cfg = CONFIG["volume_spike"]
+    squeeze_cfg = CONFIG["squeeze"]
+    volume_24h = volume_24h or {}
+
+    candles_per_hour = max(1, 60 // _interval_minutes(CONFIG["interval"]))
 
     min_history = max(
         dema_cfg["length"] * 2 if dema_cfg["enabled"] else 0,
         ma_cfg["slow_length"] + gap_cfg["stdev_length"] if ma_cfg["enabled"] else 0,
+        ma_cfg["slow_length"] + squeeze_cfg["lookback"] if ma_cfg["enabled"] and squeeze_cfg["enabled"] else 0,
+        vol_cfg["lookback_15m"] + 1 if vol_cfg["enabled"] else 0,
+        candles_per_hour * (vol_cfg["lookback_1h"] + 1) if vol_cfg["enabled"] else 0,
         50,
     )
 
@@ -160,6 +328,7 @@ def check_symbol(symbol: str, state: dict) -> list[dict]:
         "dema_trade_taken": False,
         "ma_armed": False,
         "ma_gap_fired": False,
+        "squeeze_ok": None,
     })
 
     hits = []
@@ -198,6 +367,17 @@ def check_symbol(symbol: str, state: dict) -> list[dict]:
         if crossed_up:
             sym_state["ma_armed"] = True
             sym_state["ma_gap_fired"] = False
+
+            if squeeze_cfg["enabled"]:
+                # Were MA9/MA20 tight together for `lookback` candles right
+                # before this cross candle? (window excludes the cross candle
+                # itself - squeeze describes what came before it)
+                gap_pct_series = (fast_ma - slow_ma).abs() / slow_ma * 100
+                pre_cross = gap_pct_series.iloc[-(squeeze_cfg["lookback"] + 1):-1]
+                sym_state["squeeze_ok"] = bool((pre_cross <= squeeze_cfg["max_pct"]).all())
+            else:
+                sym_state["squeeze_ok"] = None
+
         if crossed_down:
             sym_state["ma_armed"] = False
             sym_state["ma_gap_fired"] = False
@@ -216,17 +396,326 @@ def check_symbol(symbol: str, state: dict) -> list[dict]:
                 stdev = gap_series.rolling(gap_cfg["stdev_length"]).std().iloc[-1]
                 gap_ok = gap_raw >= (mean + gap_cfg["stdev_multiplier"] * stdev)
 
-            if gap_ok:
+            # Volume - REQUIRED when enabled: 15m spike (strict) AND 1h
+            # spike (looser) both have to clear their own bar. The 24h
+            # floor was already applied before this symbol was ever
+            # fetched, so it's looked up here only for display.
+            ratio_15m = ratio_1h = None
+            if vol_cfg["enabled"]:
+                vol = df["volume"]
+
+                baseline_15m = vol.iloc[-(vol_cfg["lookback_15m"] + 1):-1].mean()
+                ratio_15m = (vol.iloc[-1] / baseline_15m) if baseline_15m > 0 else 0.0
+                ok_15m = ratio_15m >= vol_cfg["multiplier_15m"]
+
+                hour_sums = vol.rolling(candles_per_hour).sum()
+                current_hour_vol = hour_sums.iloc[-1]
+                baseline_1h = hour_sums.iloc[-(vol_cfg["lookback_1h"] + 1):-1].mean()
+                ratio_1h = (current_hour_vol / baseline_1h) if baseline_1h and baseline_1h > 0 else 0.0
+                ok_1h = ratio_1h >= vol_cfg["multiplier_1h"]
+
+                volume_ok = ok_15m and ok_1h
+            else:
+                volume_ok = True
+
+            if gap_ok and volume_ok:
                 sym_state["ma_gap_fired"] = True
+                detail = f"gap={gap_pct:.3f}%"
+                if vol_cfg["enabled"]:
+                    vol_24h_m = volume_24h.get(symbol, 0.0) / 1_000_000
+                    detail += f", vol15m={ratio_15m:.2f}x, vol1h={ratio_1h:.2f}x, vol24h={vol_24h_m:.1f}M"
+                if squeeze_cfg["enabled"]:
+                    detail += f", squeeze={'yes' if sym_state.get('squeeze_ok') else 'no'}"
                 hits.append({
                     "symbol": symbol,
                     "type": "MA9/20 Cross BUY",
                     "price": close.iloc[-1],
-                    "detail": f"gap={gap_pct:.3f}%",
+                    "detail": detail,
                 })
 
     state[symbol] = sym_state
     return hits
+
+
+# ============================================================
+# SCALP MODE (new, independent - no shared state with check_symbol)
+# ============================================================
+
+def check_symbol_scalp(symbol: str) -> dict | None:
+    """Snapshot-style check for the 5m scalp radar. No armed/fired state
+    across runs on purpose - this is meant to surface *current* early
+    movers each run, then get ranked and trimmed to top_n in run_scan().
+    Returns a candidate dict, or None if it fails any filter."""
+    cfg = CONFIG["scalp_mode"]
+
+    min_history = max(cfg["dema_length"] * 2, cfg["vol_lookback"] + 1, 50)
+    df = get_klines(symbol, interval=cfg["interval"], limit=max(cfg["candle_limit"], min_history + 5))
+    if len(df) < min_history:
+        return None
+
+    df = df.iloc[:-1]  # drop the still-forming candle
+    close = df["close"]
+    open_ = df["open"]
+    vol = df["volume"]
+
+    # -- 5m volume spike: fire candle vs its own recent baseline --
+    baseline = vol.iloc[-(cfg["vol_lookback"] + 1):-1].mean()
+    ratio = (vol.iloc[-1] / baseline) if baseline > 0 else 0.0
+    if ratio < cfg["vol_multiplier"]:
+        return None
+
+    # -- green candle / price up % --
+    last_open, last_close = open_.iloc[-1], close.iloc[-1]
+    change_pct = (last_close - last_open) / last_open * 100
+    if not (last_close > last_open and change_pct >= cfg["min_price_change_pct"]):
+        return None
+
+    # -- DEMA200 trend filter (5m) --
+    dema_val = dema(close, cfg["dema_length"])
+    last_dema = dema_val.iloc[-1]
+    dema_pct = (last_close - last_dema) / last_dema * 100
+    if dema_pct < cfg["dema_min_pct_above"]:
+        return None
+
+    # -- SuperTrend bullish (5m), same atr/multiplier as main config --
+    st = supertrend(df, CONFIG["supertrend"]["atr_length"], CONFIG["supertrend"]["multiplier"])
+    if not (st["direction"].iloc[-1] < 0):
+        return None
+
+    return {
+        "symbol": symbol,
+        "price": last_close,
+        "ratio": ratio,
+        "change_pct": change_pct,
+        "dema_pct": dema_pct,
+    }
+
+
+def run_scalp_scan(symbols: list[str]) -> None:
+    cfg = CONFIG["scalp_mode"]
+    print(f"\nScalp mode: scanning {len(symbols)} pairs on {cfg['interval']}...")
+
+    candidates = []
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            hit = check_symbol_scalp(symbol)
+            if hit:
+                candidates.append(hit)
+        except Exception as e:
+            print(f"  {symbol}: scalp skipped ({e})")
+        time.sleep(CONFIG["request_sleep"])
+
+        if i % 50 == 0:
+            print(f"  ...{i}/{len(symbols)} scalp-scanned")
+
+    candidates.sort(key=lambda c: c["ratio"], reverse=True)
+    top = candidates[: cfg["top_n"]]
+
+    if not top:
+        print("  No scalp setups this run.")
+        return
+
+    lines = [f"🚀 **Scalp Setup** (5m vol+price+DEMA200+SuperTrend) - top {len(top)}"]
+    for c in top:
+        lines.append(
+            f"{c['symbol']} @ {c['price']} - vol5m={c['ratio']:.2f}x, "
+            f"chg={c['change_pct']:.2f}%, DEMA200 +{c['dema_pct']:.2f}%"
+        )
+    msg = "\n".join(lines)
+    print(msg)
+    send_discord(msg)
+
+
+# ============================================================
+# NOUMAN STRATEGY (new, independent - own state file, own message)
+# ============================================================
+
+def rsi(close: pd.Series, length: int) -> pd.Series:
+    """Wilder's RSI (matches TradingView's ta.rsi)."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-12)
+    return 100 - (100 / (1 + rs))
+
+
+def smoothed_heiken_ashi(df: pd.DataFrame, len1: int, len2: int, gray_body_ratio: float) -> pd.DataFrame:
+    """Reimplementation of jackvmk's "Smoothed Heiken Ashi Candles v1"
+    (TradingView ROokknI2): raw OHLC is EMA-smoothed (len1), converted to
+    Heiken Ashi, then EMA-smoothed again (len2). The published script only
+    outputs red/green (col = o2>c2 ? red : lime) - GRAY is an addition
+    here: a candle whose smoothed body is a small fraction of its own
+    high-low range (< gray_body_ratio) is classified GRAY instead of
+    GREEN/RED. See the CONFIG note for why/how to adjust this.
+    """
+    o = df["open"].ewm(span=len1, adjust=False).mean()
+    c = df["close"].ewm(span=len1, adjust=False).mean()
+    h = df["high"].ewm(span=len1, adjust=False).mean()
+    l = df["low"].ewm(span=len1, adjust=False).mean()
+
+    ha_close = (o + h + l + c) / 4
+    ha_open = pd.Series(index=df.index, dtype=float)
+    ha_open.iloc[0] = (o.iloc[0] + c.iloc[0]) / 2
+    for i in range(1, len(df)):
+        ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2
+    ha_high = pd.concat([h, ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([l, ha_open, ha_close], axis=1).min(axis=1)
+
+    o2 = ha_open.ewm(span=len2, adjust=False).mean()
+    c2 = ha_close.ewm(span=len2, adjust=False).mean()
+    h2 = ha_high.ewm(span=len2, adjust=False).mean()
+    l2 = ha_low.ewm(span=len2, adjust=False).mean()
+
+    body = (c2 - o2).abs()
+    rng = (h2 - l2).replace(0, 1e-12)
+    body_ratio = body / rng
+
+    color = pd.Series("RED", index=df.index, dtype=object)
+    color[c2 >= o2] = "GREEN"
+    color[body_ratio < gray_body_ratio] = "GRAY"
+
+    return pd.DataFrame({"o2": o2, "c2": c2, "h2": h2, "l2": l2, "color": color})
+
+
+def _fmt_vol(n: float) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n:.0f}"
+
+
+def check_symbol_nouman(symbol: str, state: dict, volume_24h: dict) -> dict | None:
+    """Returns a hit dict if BOTH requirements fire on this run, else None."""
+    cfg = CONFIG["nouman_strategy"]
+    st_cfg = CONFIG["supertrend"]
+    vol_cfg = cfg["volume_1h_filter"]
+
+    # ---- Requirement 1: 1h SuperTrend must be bullish ----
+    df_st = get_klines(symbol, interval="1h", limit=max(300, st_cfg["atr_length"] * 5))
+    if len(df_st) < st_cfg["atr_length"] * 3:
+        return None
+    df_st = df_st.iloc[:-1]  # drop the still-forming candle
+    st = supertrend(df_st, st_cfg["atr_length"], st_cfg["multiplier"])
+    if not (st["direction"].iloc[-1] < 0):
+        return None
+
+    # ---- Requirement 2: signal-timeframe candle color + RSI cross ----
+    candles_per_hour = max(1, 60 // _interval_minutes(cfg["signal_interval"]))
+    min_needed = max(cfg["ha_len1"], cfg["ha_len2"], cfg["rsi_length"]) * 4 + 10
+    df_sig = get_klines(symbol, interval=cfg["signal_interval"], limit=max(cfg["candle_limit"], min_needed))
+    if len(df_sig) < min_needed:
+        return None
+    df_sig = df_sig.iloc[:-1]  # drop the still-forming candle
+
+    ha = smoothed_heiken_ashi(df_sig, cfg["ha_len1"], cfg["ha_len2"], cfg["gray_body_ratio"])
+    rsi_series = rsi(df_sig["close"], cfg["rsi_length"])
+
+    last_color = ha["color"].iloc[-1]
+    prev_color = ha["color"].iloc[-2] if len(ha) > 1 else None
+
+    if last_color not in ("GREEN", "GRAY"):
+        return None
+
+    # Gray-candle sequence rule: previous candle must not be GREEN.
+    if last_color == "GRAY" and cfg["gray_prev_candle_rule"] and prev_color == "GREEN":
+        return None
+
+    level = cfg["rsi_cross_level"]
+    rsi_prev, rsi_now = rsi_series.iloc[-2], rsi_series.iloc[-1]
+    crossed_up = rsi_prev <= level and rsi_now > level
+    if not crossed_up:
+        return None
+
+    # ---- 1h volume: always computed for display; filter is optional ----
+    vol_1h = df_sig["volume"].iloc[-candles_per_hour:].sum()
+    if vol_cfg["enabled"]:
+        hour_sums = df_sig["volume"].rolling(candles_per_hour).sum()
+        baseline = hour_sums.iloc[-(vol_cfg["lookback"] + 1):-1].mean()
+        ratio = (vol_1h / baseline) if baseline and baseline > 0 else 0.0
+        if ratio < vol_cfg["multiplier"]:
+            return None
+
+    # ---- De-dup: only alert once per closed signal candle ----
+    candle_key = str(int(df_sig["close_time"].iloc[-1]))
+    sym_state = state.get(symbol, {})
+    if sym_state.get("last_alert_candle") == candle_key:
+        return None
+    sym_state["last_alert_candle"] = candle_key
+    state[symbol] = sym_state
+
+    return {
+        "symbol": symbol,
+        "price": df_sig["close"].iloc[-1],
+        "rsi": rsi_now,
+        "color": last_color,
+        "vol_1h": vol_1h,
+        "vol_24h": volume_24h.get(symbol, 0.0),
+    }
+
+
+def run_nouman_scan(symbols: list[str], volume_24h: dict) -> None:
+    cfg = CONFIG["nouman_strategy"]
+    print(f"\nNouman Strategy: scanning {len(symbols)} pairs "
+          f"(1h SuperTrend + {cfg['signal_interval']} HA/RSI)...")
+
+    state = load_state(NOUMAN_STATE_FILE)
+    hits = []
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            hit = check_symbol_nouman(symbol, state, volume_24h)
+            if hit:
+                hits.append(hit)
+        except Exception as e:
+            print(f"  {symbol}: nouman skipped ({e})")
+        time.sleep(CONFIG["request_sleep"])
+
+        if i % 50 == 0:
+            print(f"  ...{i}/{len(symbols)} nouman-scanned")
+
+    save_state(state, NOUMAN_STATE_FILE)
+
+    if not hits:
+        print("  No Nouman Strategy signals this run.")
+        return
+
+    header = "🎯 **Nouman Strategy**"
+    lines = [
+        f"{h['symbol']} | 1h Vol: {_fmt_vol(h['vol_1h'])} USDT | "
+        f"24h Vol: {_fmt_vol(h['vol_24h'])} USDT | RSI: {h['rsi']:.1f} | "
+        f"Candle: {h['color']} | SuperTrend: Bullish"
+        for h in hits
+    ]
+
+    # The strategy name is printed ONCE at the top of the batch, not per
+    # coin. Discord hard-caps messages at 2000 chars, so long batches are
+    # split into multiple messages - only the first carries the plain
+    # header, later chunks are marked "(cont'd)" so it's still obvious
+    # they belong to the same run.
+    chunk_lines: list[str] = []
+    is_first_chunk = True
+
+    def _flush():
+        nonlocal chunk_lines, is_first_chunk
+        if not chunk_lines:
+            return
+        title = header if is_first_chunk else f"{header} (cont'd)"
+        msg = title + "\n" + "\n".join(chunk_lines)
+        print(msg)
+        send_discord(msg)
+        chunk_lines = []
+        is_first_chunk = False
+
+    for line in lines:
+        projected_len = len(header) + 1 + sum(len(l) + 1 for l in chunk_lines) + len(line) + 1
+        if chunk_lines and projected_len > 1900:
+            _flush()
+        chunk_lines.append(line)
+    _flush()
 
 
 # ============================================================
@@ -235,7 +724,22 @@ def check_symbol(symbol: str, state: dict) -> list[dict]:
 
 def run_scan() -> None:
     print(f"Fetching Binance {CONFIG['quote_asset']} pairs...")
-    symbols = get_usdt_symbols()
+    symbols_all = get_usdt_symbols()
+    symbols = symbols_all
+
+    volume_24h: dict[str, float] = {}
+    vol_cfg = CONFIG["volume_spike"]
+    nouman_cfg = CONFIG["nouman_strategy"]
+    if vol_cfg["enabled"] or nouman_cfg["enabled"]:
+        print("Fetching 24h volume for the liquidity floor (1 call, all symbols)...")
+        volume_24h = get_24h_volumes()
+
+    if vol_cfg["enabled"]:
+        before = len(symbols)
+        symbols = [s for s in symbols if volume_24h.get(s, 0.0) >= vol_cfg["min_24h_volume_usdt"]]
+        floor_m = vol_cfg["min_24h_volume_usdt"] / 1_000_000
+        print(f"  {before} pairs -> {len(symbols)} pairs clear the {floor_m:.1f}M 24h floor")
+
     print(f"Scanning {len(symbols)} pairs on {CONFIG['interval']} timeframe...\n")
 
     state = load_state()
@@ -243,7 +747,7 @@ def run_scan() -> None:
 
     for i, symbol in enumerate(symbols, 1):
         try:
-            hits = check_symbol(symbol, state)
+            hits = check_symbol(symbol, state, volume_24h)
             for h in hits:
                 all_hits.append(h)
                 msg = f"[{h['type']}] {h['symbol']} @ {h['price']} ({h['detail']})"
@@ -258,6 +762,16 @@ def run_scan() -> None:
 
     save_state(state)
     print(f"\nDone. {len(all_hits)} fresh signal(s) found.")
+
+    # ---- Scalp mode: fully separate pass, only runs if switched on ----
+    if CONFIG["scalp_mode"]["enabled"]:
+        run_scalp_scan(symbols)
+
+    # ---- Nouman Strategy: fully separate pass, own liquidity floor ----
+    if nouman_cfg["enabled"]:
+        floor = nouman_cfg["min_24h_volume_usdt"]
+        nouman_symbols = [s for s in symbols_all if volume_24h.get(s, 0.0) >= floor]
+        run_nouman_scan(nouman_symbols, volume_24h)
 
 
 if __name__ == "__main__":
