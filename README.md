@@ -105,3 +105,14 @@ You'll get a Discord message like:
 - Ported signals: DEMA200+SuperTrend and MA9/20 cross only. FBB exits,
   stop loss/take profit, and HPSU are not in this scanner - say the word
   if you want those added too.
+
+
+DEMA/MA-cross (original) — Trend + crossover: price above a 200 DEMA with SuperTrend confirming an uptrend, plus a 9/20 moving-average cross. The oldest strategy in the file. Off by default now.
+
+Scalp Mode — A 5-minute early-scalp radar: ranks coins by a volume spike, then confirms with a green candle plus the DEMA/SuperTrend trend filter. Off by default.
+
+Nouman Strategy — A 1-hour trend-continuation setup: SuperTrend must be bullish, the smoothed Heiken Ashi candle must be green or gray (never red), and RSI must cross up through 52. Fires once per qualifying candle.
+
+Nouman Strategy (Scalp) – Support with RSI — An oversold-bounce setup: both 1h and 15m trend must be up, price must be sitting just above a recent support level, and RSI must cross up through 25 from oversold (20-25) with volume rising for 5 straight candles. Naturally rare — genuine 15m oversold usually coincides with the 15m trend flipping too, so expect fewer hits than the others.
+
+Squeeze Breakout — A faster, leading signal instead of trend-confirmation: catches a coin that's gone quiet (Bollinger Band squeeze) breaking out on rising volume, now requiring the 15m trend to also be up. Runs two ways — a scheduled REST scan, or a live WebSocket version that reacts the instant a candle closes instead of waiting for the next cron trigger.
