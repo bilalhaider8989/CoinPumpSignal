@@ -241,6 +241,19 @@ CONFIG = {
         "interval": "1m",          # "1m" or "5m" - short by design
         "candle_limit": 300,
 
+        # Higher-timeframe trend filter - added after seeing the module
+        # fire on a 1-minute bounce that went against the broader trend
+        # (a real gap: this module had no trend context at all before).
+        # ON by default: only takes the 1m/5m breakout if the 15m trend
+        # is ALSO up (same shared SuperTrend used everywhere else in
+        # this file). This is standard multi-timeframe practice - lower
+        # timeframe for entry timing, higher timeframe for direction -
+        # and directly targets the "alert fired mid-decline" case.
+        "trend_filter": {
+            "enabled": True,
+            "interval": "15m",
+        },
+
         # Only scan THESE symbols instead of the full ~500+ USDT pair
         # universe. For 1-5 minute scalping, looping through hundreds of
         # symbols with request_sleep between each call takes real
@@ -364,6 +377,48 @@ CONFIG = {
             ("18:00", "19:30"),
             ("20:30", "21:30"),
         ],
+    },
+
+    # ---- BACKTEST (used only by backtest.py, not the live scanners) ----
+    # Walks real historical Binance data bar-by-bar, calling the EXACT
+    # SAME check_symbol_*() functions the live scanners use (via a
+    # temporary monkeypatch of get_klines that only reveals data up to
+    # the simulated "current" bar - no lookahead). Entry = whenever a
+    # check_symbol_*() call returns a hit. Exit = whichever of
+    # take-profit / stop-loss / max-hold comes first, since none of the
+    # live scanners define an exit on their own - that's a real gap, and
+    # these numbers are a starting assumption, not a recommendation.
+    # Tune them to match how you'd actually manage a trade.
+    "backtest": {
+        # Which strategies to test. Options: "nouman_strategy",
+        # "nouman_scalp", "squeeze_breakout".
+        "strategies": ["nouman_strategy", "nouman_scalp", "squeeze_breakout"],
+
+        # Empty = auto-pick the top N by 24h volume (same helper the
+        # live scanners use). Fill in specific symbols to test a fixed
+        # set instead.
+        "symbols": [],
+        "top_n_symbols": 15,
+
+        # How far back to fetch history, PER STRATEGY - shorter for
+        # squeeze_breakout since it runs on 1-minute candles (a long
+        # window there means a very large, slow download).
+        "history_days": {
+            "nouman_strategy": 90,
+            "nouman_scalp": 45,
+            "squeeze_breakout": 5,
+        },
+
+        # Exit rules - NOT used by the live scanners, only this backtest.
+        "exits": {
+            "nouman_strategy":  {"take_profit_pct": 3.0, "stop_loss_pct": 1.5, "max_hold_bars": 48},
+            "nouman_scalp":     {"take_profit_pct": 2.0, "stop_loss_pct": 1.0, "max_hold_bars": 20},
+            "squeeze_breakout": {"take_profit_pct": 1.5, "stop_loss_pct": 1.0, "max_hold_bars": 30},
+        },
+
+        "warmup_bars": 210,   # bars of history required before the walk starts checking for signals
+        "request_sleep": 0.25,
+        "output_csv": True,   # write a per-trade CSV alongside the summary
     },
 
     # ---- 6. Discord notifications (free, no bot needed) ----
@@ -1094,7 +1149,20 @@ def bollinger_bands(close: pd.Series, length: int, mult: float) -> pd.DataFrame:
 
 def check_symbol_squeeze(symbol: str, state: dict, volume_24h: dict) -> dict | None:
     cfg = CONFIG["squeeze_breakout"]
+    tf_cfg = cfg["trend_filter"]
+    st_cfg = CONFIG["supertrend"]
     min_needed = max(cfg["bb_length"], cfg["squeeze_lookback"], cfg["vol_lookback"]) + 10
+
+    # ---- Higher-timeframe trend filter (checked first - cheapest way
+    # to skip a symbol before doing the more detailed 1m/5m work) ----
+    if tf_cfg["enabled"]:
+        df_tf = get_klines(symbol, interval=tf_cfg["interval"], limit=max(300, st_cfg["atr_length"] * 5))
+        if len(df_tf) < st_cfg["atr_length"] * 3:
+            return None
+        df_tf = df_tf.iloc[:-1]
+        st_tf = supertrend(df_tf, st_cfg["atr_length"], st_cfg["multiplier"])
+        if not (st_tf["direction"].iloc[-1] < 0):
+            return None
 
     df = get_klines(symbol, interval=cfg["interval"], limit=max(cfg["candle_limit"], min_needed))
     if len(df) < min_needed:
@@ -1166,9 +1234,11 @@ def run_squeeze_scan(symbols: list[str], volume_24h: dict) -> None:
         return
 
     header = "⚡ **Squeeze Breakout**"
+    tf_cfg = cfg["trend_filter"]
+    trend_label = f" | {tf_cfg['interval'].upper()}: Bullish" if tf_cfg["enabled"] else ""
     lines = [
         f"{h['symbol']} | 24h Vol: {_fmt_vol(h['vol_24h'])} USDT | "
-        f"Vol Spike: {h['vol_ratio']:.2f}x | BB Width: {h['width_pct']:.2f}%"
+        f"Vol Spike: {h['vol_ratio']:.2f}x | BB Width: {h['width_pct']:.2f}%{trend_label}"
         for h in hits
     ]
     msg = header + "\n" + "\n".join(lines)

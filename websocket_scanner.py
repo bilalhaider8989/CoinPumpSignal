@@ -80,6 +80,7 @@ from binance_scanner import (
     load_state,
     save_state,
     send_discord,
+    supertrend,
 )
 
 # Market-data-only endpoint, no API key needed - mirrors the REST
@@ -123,9 +124,43 @@ async def _seed_history(symbols: list[str], interval: str, candle_limit: int) ->
     return history
 
 
-def evaluate_squeeze_live(symbol: str, df: pd.DataFrame, state: dict) -> dict | None:
-    """Same rules as check_symbol_squeeze() in binance_scanner.py."""
+async def _seed_trend(symbols: list[str], trend_interval: str) -> dict[str, bool]:
+    """One-time REST pull + SuperTrend check on a higher timeframe
+    (15m by default), done ONCE per burst rather than per tick - a 15m
+    trend essentially never flips within a single ~4 minute burst, so
+    there's no need to re-check it live. Same shared supertrend()
+    already used everywhere else in binance_scanner.py."""
+    st_cfg = CONFIG["supertrend"]
+    print(f"Checking {trend_interval} trend for {len(symbols)} symbols (one-time, concurrent)...")
+
+    async def _check_one(symbol: str) -> tuple[str, bool]:
+        try:
+            df = await asyncio.to_thread(get_klines, symbol, trend_interval, max(300, st_cfg["atr_length"] * 5))
+            df = df.iloc[:-1]
+            if len(df) < st_cfg["atr_length"] * 3:
+                return symbol, False
+            st = supertrend(df, st_cfg["atr_length"], st_cfg["multiplier"])
+            return symbol, bool(st["direction"].iloc[-1] < 0)
+        except Exception as e:
+            print(f"  {symbol}: trend check failed ({e})")
+            return symbol, False
+
+    results = await asyncio.gather(*[_check_one(s) for s in symbols])
+    trend_ok = {symbol: ok for symbol, ok in results}
+    bullish_count = sum(trend_ok.values())
+    print(f"  {bullish_count}/{len(symbols)} symbols have a bullish {trend_interval} trend right now.")
+    return trend_ok
+
+
+def evaluate_squeeze_live(symbol: str, df: pd.DataFrame, state: dict, trend_ok: dict[str, bool]) -> dict | None:
+    """Same rules as check_symbol_squeeze() in binance_scanner.py,
+    including the higher-timeframe trend filter (checked against the
+    ONE-TIME result from _seed_trend, not re-fetched per tick)."""
     cfg = CONFIG["squeeze_breakout"]
+    tf_cfg = cfg["trend_filter"]
+    if tf_cfg["enabled"] and not trend_ok.get(symbol, False):
+        return None
+
     min_needed = max(cfg["bb_length"], cfg["squeeze_lookback"], cfg["vol_lookback"]) + 10
     if len(df) < min_needed:
         return None
@@ -166,7 +201,7 @@ def evaluate_squeeze_live(symbol: str, df: pd.DataFrame, state: dict) -> dict | 
 
 async def _listen_live(symbols: list[str], interval: str, deadline: float,
                         history: dict[str, list[dict]], candle_limit: int,
-                        state: dict, hits: list) -> None:
+                        state: dict, hits: list, trend_ok: dict[str, bool]) -> None:
     streams = "/".join(f"{s.lower()}@kline_{interval}" for s in symbols)
     url = f"{BINANCE_WS_BASE}?streams={streams}"
 
@@ -200,7 +235,7 @@ async def _listen_live(symbols: list[str], interval: str, deadline: float,
                 history[symbol] = history[symbol][-candle_limit:]
 
             df = pd.DataFrame(history[symbol])
-            hit = evaluate_squeeze_live(symbol, df, state)
+            hit = evaluate_squeeze_live(symbol, df, state, trend_ok)
             if hit:
                 hits.append(hit)
                 print(f"  LIVE hit: {hit['symbol']} (vol {hit['vol_ratio']:.2f}x)")
@@ -226,10 +261,17 @@ def run_websocket_burst() -> None:
 
     state = load_state(SQUEEZE_STATE_FILE)
     hits: list = []
+    tf_cfg = cfg["trend_filter"]
 
     async def _run():
-        history = await _seed_history(symbols, cfg["interval"], cfg["candle_limit"])
-        await _listen_live(symbols, cfg["interval"], deadline, history, cfg["candle_limit"], state, hits)
+        history_task = _seed_history(symbols, cfg["interval"], cfg["candle_limit"])
+        if tf_cfg["enabled"]:
+            trend_task = _seed_trend(symbols, tf_cfg["interval"])
+            history, trend_ok = await asyncio.gather(history_task, trend_task)
+        else:
+            history = await history_task
+            trend_ok = {s: True for s in symbols}  # filter is off, treat everyone as passing
+        await _listen_live(symbols, cfg["interval"], deadline, history, cfg["candle_limit"], state, hits, trend_ok)
 
     try:
         asyncio.run(_run())
@@ -243,8 +285,9 @@ def run_websocket_burst() -> None:
         return
 
     header = "⚡ **Squeeze Breakout (live)**"
+    trend_label = f" | {tf_cfg['interval'].upper()}: Bullish" if tf_cfg["enabled"] else ""
     lines = [
-        f"{h['symbol']} | Vol Spike: {h['vol_ratio']:.2f}x | BB Width: {h['width_pct']:.2f}%"
+        f"{h['symbol']} | Vol Spike: {h['vol_ratio']:.2f}x | BB Width: {h['width_pct']:.2f}%{trend_label}"
         for h in hits
     ]
     msg = header + "\n" + "\n".join(lines)

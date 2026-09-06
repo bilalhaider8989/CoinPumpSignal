@@ -1,0 +1,29 @@
+name: Backtest
+
+on:
+  workflow_dispatch: {}   # manual trigger only - no schedule
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backtest
+        run: python backtest.py
+
+      - name: Upload trade logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: backtest_*_trades.csv
+          if-no-files-found: ignore
