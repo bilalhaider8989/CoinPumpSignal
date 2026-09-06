@@ -34,7 +34,7 @@ jobs:
       - name: Run scanner
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python scanner.py
+        run: python binance_scanner.py
 
   websocket-scan:
     runs-on: ubuntu-latest

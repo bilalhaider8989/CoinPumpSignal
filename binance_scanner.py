@@ -32,6 +32,7 @@ BINANCE_BASE = "https://data-api.binance.vision"
 STATE_FILE = Path(__file__).parent / "scanner_state.json"
 NOUMAN_STATE_FILE = Path(__file__).parent / "nouman_state.json"
 SQUEEZE_STATE_FILE = Path(__file__).parent / "squeeze_state.json"
+NOUMAN_SCALP_STATE_FILE = Path(__file__).parent / "nouman_scalp_state.json"
 
 # ============================================================
 # CONFIG - edit these to match your Pine script settings
@@ -280,6 +281,67 @@ CONFIG = {
         "websocket_burst": {
             "max_runtime_seconds": 240,
         },
+    },
+
+    # ---- NOUMAN STRATEGY (SCALP) - "Support with RSI" ----
+    # A different setup from the original Nouman Strategy: instead of a
+    # trend-pullback continuation (green/gray candle + RSI cross-up-52),
+    # this looks for an oversold BOUNCE at a support level:
+    #   1. 1h trend is up (SuperTrend bullish - same shared indicator/
+    #      params as everything else in this file).
+    #   2. 15m trend is also up (SuperTrend bullish on 15m).
+    #   3. Price is sitting just above a recent 15m support level (a
+    #      pivot low - the same core idea as the LuxAlgo "Support and
+    #      Resistance Levels with Breaks" indicator you linked: a candle
+    #      counts as support if its low is the lowest within
+    #      pivot_left_bars before AND pivot_right_bars after it. We only
+    #      use the level-identification part of that indicator, not its
+    #      breakout-with-volume-oscillator signal - you're describing a
+    #      bounce AT support, not a break THROUGH it).
+    #   4. RSI was oversold (20-25) and just crossed up through 25, WITH
+    #      volume rising for several candles in a row.
+    # All confirmed via your answers: entry check on 15m, support
+    # proximity 0-4% above the level, RSI cross-up-25 from the 20-25
+    # zone with continuously rising volume.
+    "nouman_scalp": {
+        "enabled": True,
+
+        "interval": "15m",       # support/RSI/volume entry check timeframe
+        "candle_limit": 300,
+        "min_24h_volume_usdt": 3_000_000,
+
+        # Trend filters - both must be bullish to even look for an entry.
+        "trend_1h_required": True,
+        "trend_15m_required": True,
+
+        # Support level = most recent CONFIRMED pivot low: the lowest
+        # low within pivot_left_bars candles before and
+        # pivot_right_bars candles after it. Confirmation needs
+        # pivot_right_bars of future candles, so the very newest bars
+        # can never be a confirmed pivot yet - that's expected, not a
+        # bug (same trade-off the LuxAlgo indicator has).
+        "pivot_left_bars": 10,
+        "pivot_right_bars": 10,
+
+        # "At support" = signal candle's close is between the support
+        # level and support level + this % (0% to 4% ABOVE it, not
+        # below - a bounce that's already turned up, not still testing
+        # the level from underneath).
+        "support_proximity_pct": 4.0,
+
+        # RSI: previous candle's RSI must sit in [rsi_floor,
+        # rsi_cross_level] (the 20-25 oversold zone), current candle's
+        # RSI must be just above rsi_cross_level - a genuine cross-up,
+        # not merely "RSI is above 25 today."
+        "rsi_length": 14,
+        "rsi_floor": 20,
+        "rsi_cross_level": 25,
+
+        # Volume must rise for this many candles in a row leading into
+        # the signal candle. Always-on for this strategy (not an
+        # optional toggle) since you specifically asked for continuously
+        # rising volume as a core part of the setup.
+        "volume_rising_lookback": 5,
     },
 
     # ---- 5. Alert time windows (optional quiet hours / focus hours) ----
@@ -887,6 +949,137 @@ def run_nouman_scan(symbols: list[str], volume_24h: dict) -> None:
 
 
 # ============================================================
+# NOUMAN STRATEGY (SCALP) - "Support with RSI" (new, independent)
+# ============================================================
+
+def find_pivot_low_support(df: pd.DataFrame, left_bars: int, right_bars: int) -> float | None:
+    """Most recent CONFIRMED pivot low - a candle whose low is the
+    lowest within left_bars candles before it and right_bars candles
+    after it (same core idea as LuxAlgo's pivot-based S/R indicator).
+    Confirmation needs right_bars of FUTURE candles past the pivot, so
+    the newest right_bars candles in df can never be a confirmed pivot
+    yet - that's expected, not a bug."""
+    lows = df["low"].to_numpy()
+    n = len(lows)
+    latest_confirmable = n - right_bars - 1
+    for i in range(latest_confirmable, left_bars - 1, -1):
+        if i - left_bars < 0:
+            break
+        window = lows[i - left_bars: i + right_bars + 1]
+        if lows[i] <= window.min():
+            return float(lows[i])
+    return None
+
+
+def check_symbol_nouman_scalp(symbol: str, state: dict, volume_24h: dict) -> dict | None:
+    cfg = CONFIG["nouman_scalp"]
+    st_cfg = CONFIG["supertrend"]
+
+    # ---- Requirement 1: 1h trend must be up ----
+    if cfg["trend_1h_required"]:
+        df_1h = get_klines(symbol, interval="1h", limit=max(300, st_cfg["atr_length"] * 5))
+        if len(df_1h) < st_cfg["atr_length"] * 3:
+            return None
+        df_1h = df_1h.iloc[:-1]
+        st_1h = supertrend(df_1h, st_cfg["atr_length"], st_cfg["multiplier"])
+        if not (st_1h["direction"].iloc[-1] < 0):
+            return None
+
+    # ---- Requirement 2 + entry check: 15m ----
+    min_needed = max(
+        cfg["pivot_left_bars"] + cfg["pivot_right_bars"] + 5,
+        cfg["rsi_length"] * 4,
+        cfg["volume_rising_lookback"] + 5,
+        st_cfg["atr_length"] * 3,
+    )
+    df_15m = get_klines(symbol, interval=cfg["interval"], limit=max(cfg["candle_limit"], min_needed))
+    if len(df_15m) < min_needed:
+        return None
+    df_15m = df_15m.iloc[:-1]  # drop the still-forming candle
+
+    if cfg["trend_15m_required"]:
+        st_15m = supertrend(df_15m, st_cfg["atr_length"], st_cfg["multiplier"])
+        if not (st_15m["direction"].iloc[-1] < 0):
+            return None
+
+    # ---- Support level + proximity ----
+    support = find_pivot_low_support(df_15m, cfg["pivot_left_bars"], cfg["pivot_right_bars"])
+    if support is None or support <= 0:
+        return None
+
+    close_now = df_15m["close"].iloc[-1]
+    distance_pct = (close_now - support) / support * 100
+    if not (0 <= distance_pct <= cfg["support_proximity_pct"]):
+        return None
+
+    # ---- RSI cross-up from oversold ----
+    rsi_series = rsi(df_15m["close"], cfg["rsi_length"])
+    rsi_prev, rsi_now = rsi_series.iloc[-2], rsi_series.iloc[-1]
+    if not (cfg["rsi_floor"] <= rsi_prev <= cfg["rsi_cross_level"] and rsi_now > cfg["rsi_cross_level"]):
+        return None
+
+    # ---- Volume rising continuously ----
+    recent_vols = df_15m["volume"].iloc[-cfg["volume_rising_lookback"]:]
+    if len(recent_vols) < cfg["volume_rising_lookback"] or not recent_vols.diff().iloc[1:].gt(0).all():
+        return None
+
+    # ---- De-dup: only alert once per closed signal candle ----
+    candle_key = str(int(df_15m["close_time"].iloc[-1]))
+    sym_state = state.get(symbol, {})
+    if sym_state.get("last_alert_candle") == candle_key:
+        return None
+    sym_state["last_alert_candle"] = candle_key
+    state[symbol] = sym_state
+
+    return {
+        "symbol": symbol,
+        "price": close_now,
+        "support": support,
+        "distance_pct": distance_pct,
+        "rsi_prev": rsi_prev,
+        "rsi": rsi_now,
+        "vol_24h": volume_24h.get(symbol, 0.0),
+    }
+
+
+def run_nouman_scalp_scan(symbols: list[str], volume_24h: dict) -> None:
+    cfg = CONFIG["nouman_scalp"]
+    print(f"\nNouman Strategy (Scalp): scanning {len(symbols)} pairs "
+          f"(1h+15m trend + support/RSI/volume on {cfg['interval']})...")
+
+    state = load_state(NOUMAN_SCALP_STATE_FILE)
+    hits = []
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            hit = check_symbol_nouman_scalp(symbol, state, volume_24h)
+            if hit:
+                hits.append(hit)
+        except Exception as e:
+            print(f"  {symbol}: nouman-scalp skipped ({e})")
+        time.sleep(CONFIG["request_sleep"])
+
+        if i % 50 == 0:
+            print(f"  ...{i}/{len(symbols)} scanned")
+
+    save_state(state, NOUMAN_SCALP_STATE_FILE)
+
+    if not hits:
+        print("  No Nouman Strategy (Scalp) signals this run.")
+        return
+
+    header = "🎯 **Nouman Strategy (Scalp) - Support with RSI**"
+    lines = [
+        f"{h['symbol']} | Price: {h['price']:.6g} | Support: {h['support']:.6g} "
+        f"(+{h['distance_pct']:.2f}%) | RSI: {h['rsi_prev']:.1f}→{h['rsi']:.1f} | "
+        f"Vol: rising | 1H+15M: Bullish | 24h Vol: {_fmt_vol(h['vol_24h'])} USDT"
+        for h in hits
+    ]
+    msg = header + "\n" + "\n".join(lines)
+    print(msg)
+    send_discord(msg)
+
+
+# ============================================================
 # SQUEEZE BREAKOUT (new, independent - a LEADING signal, see CONFIG note)
 # ============================================================
 
@@ -996,7 +1189,8 @@ def run_scan() -> None:
     vol_cfg = CONFIG["volume_spike"]
     nouman_cfg = CONFIG["nouman_strategy"]
     squeeze_cfg = CONFIG["squeeze_breakout"]
-    if vol_cfg["enabled"] or nouman_cfg["enabled"] or squeeze_cfg["enabled"]:
+    nouman_scalp_cfg = CONFIG["nouman_scalp"]
+    if vol_cfg["enabled"] or nouman_cfg["enabled"] or squeeze_cfg["enabled"] or nouman_scalp_cfg["enabled"]:
         print("Fetching 24h volume for the liquidity floor (1 call, all symbols)...")
         volume_24h = get_24h_volumes()
 
@@ -1042,6 +1236,12 @@ def run_scan() -> None:
         floor = nouman_cfg["min_24h_volume_usdt"]
         nouman_symbols = [s for s in symbols_all if volume_24h.get(s, 0.0) >= floor]
         run_nouman_scan(nouman_symbols, volume_24h)
+
+    # ---- Nouman Strategy (Scalp): fully separate pass, own liquidity floor ----
+    if nouman_scalp_cfg["enabled"]:
+        floor = nouman_scalp_cfg["min_24h_volume_usdt"]
+        nouman_scalp_symbols = [s for s in symbols_all if volume_24h.get(s, 0.0) >= floor]
+        run_nouman_scalp_scan(nouman_scalp_symbols, volume_24h)
 
     # ---- Squeeze Breakout: fully separate pass, own liquidity floor ----
     # Uses your fixed symbol_whitelist if you set one; otherwise
