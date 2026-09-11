@@ -169,7 +169,7 @@ CONFIG = {
     # indicator with its own gray logic), tell me the exact rule/Pine code
     # and I'll swap it in - everything else here is unaffected.
     "nouman_strategy": {
-        "enabled": True,          # <-- flip this on/off
+        "enabled": false,          # <-- flip this on/off
 
         "signal_interval": "1h",  # "1h" or "30m" - the configurable TF
         "candle_limit": 500,
@@ -317,7 +317,7 @@ CONFIG = {
     # proximity 0-4% above the level, RSI cross-up-25 from the 20-25
     # zone with continuously rising volume.
     "nouman_scalp": {
-        "enabled": True,
+        "enabled": false,
 
         "interval": "15m",       # support/RSI/volume entry check timeframe
         "candle_limit": 300,
