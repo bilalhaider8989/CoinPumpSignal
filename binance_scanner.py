@@ -400,13 +400,19 @@ CONFIG = {
         "symbols": [],
         "top_n_symbols": 15,
 
+        # Symbols to always exclude from the backtest. No automatic
+        # "meme coin" / "defi coin" detection exists - maintain this
+        # list by hand. Example:
+        # ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "FLOKIUSDT", "BONKUSDT"]
+        "symbol_blacklist": [],
+
         # How far back to fetch history, PER STRATEGY - shorter for
         # squeeze_breakout since it runs on 1-minute candles (a long
         # window there means a very large, slow download).
         "history_days": {
             "nouman_strategy": 90,
             "nouman_scalp": 45,
-            "squeeze_breakout": 5,
+            "squeeze_breakout": 60,
         },
 
         # Exit rules - NOT used by the live scanners, only this backtest.
@@ -419,6 +425,19 @@ CONFIG = {
         "warmup_bars": 210,   # bars of history required before the walk starts checking for signals
         "request_sleep": 0.25,
         "output_csv": True,   # write a per-trade CSV alongside the summary
+
+        # ---- Risk management (backtest.py only - position sizing +
+        # daily circuit breaker. The live scanners still just send
+        # Discord alerts; they don't size or place real orders.) ----
+        "risk_management": {
+            "starting_balance": 1_000.0,   # reference account size, USD
+            "risk_pct_per_trade": 1.0,      # % of starting_balance risked if the stop-loss is hit
+            "daily_loss_limit": 3,          # stop opening NEW trades for the rest of the UTC day
+                                            # after this many CONSECUTIVE losing trades close
+                                            # (across any symbol). Resets on the next win and at
+                                            # the next UTC day. Set to 0 to disable.
+            "max_concurrent_positions": 3,  # cap on simultaneously open trades across all symbols
+        },
     },
 
     # ---- 6. Discord notifications (free, no bot needed) ----
