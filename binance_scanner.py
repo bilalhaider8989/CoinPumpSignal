@@ -236,7 +236,7 @@ CONFIG = {
     # by default (fewer symbols = each scan pass finishes in seconds, not
     # minutes - see the note on symbol_whitelist below).
     "squeeze_breakout": {
-        "enabled": False,
+        "enabled": True,
 
         "interval": "1m",          # "1m" or "5m" - short by design
         "candle_limit": 300,
